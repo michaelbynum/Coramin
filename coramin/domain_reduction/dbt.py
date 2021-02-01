@@ -421,7 +421,7 @@ def convert_pyomo_model_to_bipartite_graph(m):
     graph = networkx.Graph()
     var_map = pe.ComponentMap()
 
-    for v in nonrelaxation_component_data_objects(m, pe.Var, sort=True, descend_into=True):
+    for v in ComponentSet(nonrelaxation_component_data_objects(m, pe.Var, sort=True, descend_into=True)):
         var_map[v] = _VarNode(v)
         graph.add_node(var_map[v])
 

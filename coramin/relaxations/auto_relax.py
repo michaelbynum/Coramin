@@ -14,6 +14,8 @@ from coramin.utils.coramin_enums import RelaxationSide, FunctionShape
 from pyomo.gdp import Disjunct
 from pyomo.core.base.expression import _GeneralExpressionData, SimpleExpression
 from coramin.relaxations.iterators import nonrelaxation_component_data_objects
+from pyomo.repn.standard_repn import generate_standard_repn
+
 
 logger = logging.getLogger(__name__)
 
@@ -812,54 +814,249 @@ _relax_root_to_leaf_map[_GeneralExpressionData] = _relax_root_to_leaf_GeneralExp
 _relax_root_to_leaf_map[SimpleExpression] = _relax_root_to_leaf_GeneralExpression
 
 
-class _FactorableRelaxationVisitor(ExpressionValueVisitor):
+class FactorableRelaxationVisitor(ExpressionValueVisitor):
     """
     This walker generates new constraints with nonlinear terms replaced by
     auxiliary variables, and relaxations relating the auxilliary variables to
     the original variables.
     """
-    def __init__(self, aux_var_map, parent_block, relaxation_side_map, counter, degree_map):
-        self.aux_var_map = aux_var_map
-        self.parent_block = parent_block
-        self.relaxation_side_map = relaxation_side_map
-        self.counter = counter
-        self.degree_map = degree_map
+    def __init__(self, aux_var_map=None, counter_dict=None, degree_map=None):
+        if aux_var_map is None:
+            self.aux_var_map = dict()
+        else:
+            self.aux_var_map = aux_var_map
+        if counter_dict is None:
+            self._counter_dict = dict()
+        else:
+            self._counter_dict = counter_dict
+        if degree_map is None:
+            self._degree_map = ComponentMap()
+        else:
+            self._degree_map = degree_map
+        self._parent_block = None
+        self._relaxation_side_map = None
+        self._counter = None
 
     def visit(self, node, values):
         if node.__class__ in _relax_leaf_to_root_map:
-            res = _relax_leaf_to_root_map[node.__class__](node, values, self.aux_var_map, self.degree_map,
-                                                          self.parent_block, self.relaxation_side_map, self.counter)
+            res = _relax_leaf_to_root_map[node.__class__](node, values, self.aux_var_map, self._degree_map,
+                                                          self._parent_block, self._relaxation_side_map,
+                                                          self._counter)
             return res
         else:
             raise NotImplementedError('Cannot relax an expression of type ' + str(type(node)))
 
     def visiting_potential_leaf(self, node):
         if node.__class__ in nonpyomo_leaf_types:
-            self.degree_map[node] = 0
+            self._degree_map[node] = 0
             return True, node
 
         if node.is_variable_type():
-            self.degree_map[node] = 1
+            self._degree_map[node] = 1
             return True, node
 
         if not node.is_expression_type():
-            self.degree_map[node] = 0
+            self._degree_map[node] = 0
             return True, node
 
         if node.__class__ in _relax_root_to_leaf_map:
-            _relax_root_to_leaf_map[node.__class__](node, self.relaxation_side_map)
+            _relax_root_to_leaf_map[node.__class__](node, self._relaxation_side_map)
         else:
             raise NotImplementedError('Cannot relax an expression of type ' + str(type(node)))
 
         return False, None
 
+    def _relax_expr(self, expr, parent_block, relaxation_side_map, counter):
+        self._parent_block = parent_block
+        self._relaxation_side_map = relaxation_side_map
+        self._counter = counter
+        new_expr = self.dfs_postorder_stack(expr)
+        return new_expr
+
+    def relax(self, model, descend_into=None, in_place=False, use_fbbt=True, fbbt_options=None):
+        """
+        Create a convex relaxation of the model.
+
+        Parameters
+        ----------
+        model: pyomo.core.base.block._BlockData or pyomo.core.base.PyomoModel.ConcreteModel
+            The model or block to be relaxed
+        descend_into: type or tuple of type, optional
+            The types of pyomo components that should be checked for constraints to be relaxed. The
+            default is (Block, Disjunct).
+        in_place: bool, optional
+            If False (default=False), model will be cloned, and the clone will be relaxed.
+            If True, then model will be modified in place.
+        use_fbbt: bool, optional
+            If True (default=True), then FBBT will be used to tighten variable bounds. If False,
+            FBBT will not be used.
+        fbbt_options: dict, optional
+            The options to pass to the call to fbbt. See pyomo.contrib.fbbt.fbbt.fbbt for details.
+
+        Returns
+        -------
+        m: pyomo.core.base.block._BlockData or pyomo.core.base.PyomoModel.ConcreteModel
+            The relaxed model
+        """
+        """
+        For now, we will use FBBT both before relaxing the model and after relaxing the model. The reason we need to 
+        do it before relaxing the model is that the variable bounds will affect the structure of the relaxation. For 
+        example, if we need to relax x**3 and x >= 0, then we know x**3 is convex, and we can relax it as a 
+        convex, univariate function. However, if x can be positive or negative, then x**3 is neither convex nor concave.
+        In this case, we relax it by reformulating it as x * x**2. The hope is that performing FBBT before relaxing 
+        the model will help identify things like x >= 0 and therefore x**3 is convex. The correct way to do this is to 
+        update the relaxation classes so that the original expression is known, and the best relaxation can be used 
+        anytime the variable bounds are updated. For example, suppose the model is relaxed and, only after OBBT is 
+        performed, we find out x >= 0. We should be able to easily update the relaxation so that x**3 is then relaxed 
+        as a convex univariate function. The reason FBBT needs to be performed after relaxing the model is that 
+        we want to make sure that all of the auxilliary variables introduced get tightened bounds. The correct way to 
+        handle this is to perform FBBT with the original model with suspect, which forms a DAG. Each auxilliary variable 
+        introduced in the relaxed model corresponds to a node in the DAG. If we use suspect, then we can easily 
+        update the bounds of the auxilliary variables without performing FBBT a second time.
+        """
+        if not in_place:
+            m = model.clone()
+        else:
+            m = model
+
+        if fbbt_options is None:
+            fbbt_options = dict()
+
+        if use_fbbt:
+            fbbt(m, **fbbt_options)
+
+        if descend_into is None:
+            descend_into = (pe.Block, Disjunct)
+
+        for c in nonrelaxation_component_data_objects(m,
+                                                      ctype=Constraint,
+                                                      active=True,
+                                                      descend_into=descend_into,
+                                                      sort=True):
+            repn = generate_standard_repn(c.body)
+            body_degree = repn.polynomial_degree()
+            if body_degree is not None:
+                if body_degree <= 1:
+                    continue
+
+            if c.lower is not None and c.upper is not None:
+                relaxation_side = RelaxationSide.BOTH
+            elif c.lower is not None:
+                relaxation_side = RelaxationSide.OVER
+            elif c.upper is not None:
+                relaxation_side = RelaxationSide.UNDER
+            else:
+                raise ValueError('Encountered a constraint without a lower or an upper bound: ' + str(c))
+
+            lin_expr = 0
+            for i, coef in enumerate(repn.linear_coefs):
+                lin_expr += coef * repn.linear_vars[i]
+
+            quad_expr = 0
+            for i, coef in enumerate(repn.quadratic_coefs):
+                v1, v2 = repn.quadratic_vars[i]
+                quad_expr += coef * v1 * v2
+
+            nonlinear_expr = repn.nonlinear_expr
+
+            parent_block = c.parent_block()
+            relaxation_side_map = ComponentMap()
+            relaxation_side_map[quad_expr] = relaxation_side
+            relaxation_side_map[nonlinear_expr] = relaxation_side
+
+            if parent_block not in self._counter_dict:
+                parent_block.relaxations = pe.Block()
+                parent_block.aux_vars = pe.VarList()
+                parent_block.aux_cons = pe.ConstraintList()
+                counter = RelaxationCounter()
+                self._counter_dict[parent_block] = counter
+
+            new_body = repn.constant + lin_expr
+            if len(repn.quadratic_coefs) > 0:
+                new_body += self._relax_expr(expr=quad_expr,
+                                             parent_block=parent_block,
+                                             relaxation_side_map=relaxation_side_map,
+                                             counter=self._counter_dict[parent_block])
+            if repn.nonlinear_expr is not None:
+                new_body += self._relax_expr(expr=nonlinear_expr,
+                                             parent_block=parent_block,
+                                             relaxation_side_map=relaxation_side_map,
+                                             counter=self._counter_dict[parent_block])
+            lb = c.lower
+            ub = c.upper
+            parent_block.aux_cons.add(pe.inequality(lb, new_body, ub))
+            parent_component = c.parent_component()
+            if parent_component.is_indexed():
+                del parent_component[c.index()]
+            else:
+                parent_block.del_component(c)
+
+        for c in nonrelaxation_component_data_objects(m, ctype=pe.Objective, active=True, descend_into=descend_into,
+                                                      sort=True):
+            degree = polynomial_degree(c.expr)
+            if degree is not None:
+                if degree <= 1:
+                    continue
+
+            if c.sense == pe.minimize:
+                relaxation_side = RelaxationSide.UNDER
+            elif c.sense == pe.maximize:
+                relaxation_side = RelaxationSide.OVER
+            else:
+                raise ValueError('Encountered an objective with an unrecognized sense: ' + str(c))
+
+            parent_block = c.parent_block()
+            relaxation_side_map = ComponentMap()
+            relaxation_side_map[c.expr] = relaxation_side
+
+            if parent_block not in self._counter_dict:
+                parent_block.relaxations = pe.Block()
+                parent_block.aux_vars = pe.VarList()
+                parent_block.aux_cons = pe.ConstraintList()
+                counter = RelaxationCounter()
+                self._counter_dict[parent_block] = counter
+
+            if not hasattr(parent_block, 'aux_objectives'):
+                parent_block.aux_objectives = pe.ObjectiveList()
+
+            new_body = self._relax_expr(expr=c.expr,
+                                        parent_block=parent_block,
+                                        relaxation_side_map=relaxation_side_map,
+                                        counter=self._counter_dict[parent_block])
+            sense = c.sense
+            parent_block.aux_objectives.add(new_body, sense=sense)
+            parent_component = c.parent_component()
+            if parent_component.is_indexed():
+                del parent_component[c.index()]
+            else:
+                parent_block.del_component(c)
+
+        if use_fbbt:
+            for _aux_var, relaxation in self.aux_var_map.values():
+                relaxation.rebuild(build_nonlinear_constraint=True)
+
+            tmp_fbbt_options = dict(fbbt_options)
+            tmp_fbbt_options['deactivate_satisfied_constraints'] = False
+            fbbt(m, **tmp_fbbt_options)
+
+            for _aux_var, relaxation in self.aux_var_map.values():
+                relaxation.use_linear_relaxation = True
+                relaxation.rebuild()
+        else:
+            for _aux_var, relaxation in self.aux_var_map.values():
+                relaxation.use_linear_relaxation = True
+                relaxation.rebuild()
+
+        return m
+
 
 def _relax_expr(expr, aux_var_map, parent_block, relaxation_side_map, counter, degree_map):
-    visitor = _FactorableRelaxationVisitor(aux_var_map=aux_var_map, parent_block=parent_block,
-                                           relaxation_side_map=relaxation_side_map, counter=counter,
-                                           degree_map=degree_map)
-    new_expr = visitor.dfs_postorder_stack(expr)
-    return new_expr
+    visitor = FactorableRelaxationVisitor(aux_var_map=aux_var_map,
+                                          degree_map=degree_map)
+    return visitor._relax_expr(expr,
+                               parent_block=parent_block,
+                               relaxation_side_map=relaxation_side_map,
+                               counter=counter)
 
 
 def relax(model, descend_into=None, in_place=False, use_fbbt=True, fbbt_options=None):
@@ -874,10 +1071,10 @@ def relax(model, descend_into=None, in_place=False, use_fbbt=True, fbbt_options=
         The types of pyomo components that should be checked for constraints to be relaxed. The
         default is (Block, Disjunct).
     in_place: bool, optional
-        If False (default=False), model will be cloned, and the clone will be relaxed. 
+        If False (default=False), model will be cloned, and the clone will be relaxed.
         If True, then model will be modified in place.
     use_fbbt: bool, optional
-        If True (default=True), then FBBT will be used to tighten variable bounds. If False, 
+        If True (default=True), then FBBT will be used to tighten variable bounds. If False,
         FBBT will not be used.
     fbbt_options: dict, optional
         The options to pass to the call to fbbt. See pyomo.contrib.fbbt.fbbt.fbbt for details.
@@ -887,132 +1084,9 @@ def relax(model, descend_into=None, in_place=False, use_fbbt=True, fbbt_options=
     m: pyomo.core.base.block._BlockData or pyomo.core.base.PyomoModel.ConcreteModel
         The relaxed model
     """
-    """
-    For now, we will use FBBT both before relaxing the model and after relaxing the model. The reason we need to 
-    do it before relaxing the model is that the variable bounds will affect the structure of the relaxation. For 
-    example, if we need to relax x**3 and x >= 0, then we know x**3 is convex, and we can relax it as a 
-    convex, univariate function. However, if x can be positive or negative, then x**3 is neither convex nor concave.
-    In this case, we relax it by reformulating it as x * x**2. The hope is that performing FBBT before relaxing 
-    the model will help identify things like x >= 0 and therefore x**3 is convex. The correct way to do this is to 
-    update the relaxation classes so that the original expression is known, and the best relaxation can be used 
-    anytime the variable bounds are updated. For example, suppose the model is relaxed and, only after OBBT is 
-    performed, we find out x >= 0. We should be able to easily update the relaxation so that x**3 is then relaxed 
-    as a convex univariate function. The reason FBBT needs to be performed after relaxing the model is that 
-    we want to make sure that all of the auxilliary variables introduced get tightened bounds. The correct way to 
-    handle this is to perform FBBT with the original model with suspect, which forms a DAG. Each auxilliary variable 
-    introduced in the relaxed model corresponds to a node in the DAG. If we use suspect, then we can easily 
-    update the bounds of the auxilliary variables without performing FBBT a second time.
-    """
-    if not in_place:
-        m = model.clone()
-    else:
-        m = model
-
-    if fbbt_options is None:
-        fbbt_options = dict()
-
-    if use_fbbt:
-        fbbt(m, **fbbt_options)
-
-    if descend_into is None:
-        descend_into = (pe.Block, Disjunct)
-
-    aux_var_map = dict()
-    counter_dict = dict()
-    degree_map = ComponentMap()
-
-    for c in nonrelaxation_component_data_objects(m, ctype=Constraint, active=True, descend_into=descend_into, sort=True):
-        body_degree = polynomial_degree(c.body)
-        if body_degree is not None:
-            if body_degree <= 1:
-                continue
-
-        if c.lower is not None and c.upper is not None:
-            relaxation_side = RelaxationSide.BOTH
-        elif c.lower is not None:
-            relaxation_side = RelaxationSide.OVER
-        elif c.upper is not None:
-            relaxation_side = RelaxationSide.UNDER
-        else:
-            raise ValueError('Encountered a constraint without a lower or an upper bound: ' + str(c))
-
-        parent_block = c.parent_block()
-        relaxation_side_map = ComponentMap()
-        relaxation_side_map[c.body] = relaxation_side
-
-        if parent_block in counter_dict:
-            counter = counter_dict[parent_block]
-        else:
-            parent_block.relaxations = pe.Block()
-            parent_block.aux_vars = pe.VarList()
-            parent_block.aux_cons = pe.ConstraintList()
-            counter = RelaxationCounter()
-            counter_dict[parent_block] = counter
-
-        new_body = _relax_expr(expr=c.body, aux_var_map=aux_var_map, parent_block=parent_block,
-                               relaxation_side_map=relaxation_side_map, counter=counter, degree_map=degree_map)
-        lb = c.lower
-        ub = c.upper
-        parent_block.aux_cons.add(pe.inequality(lb, new_body, ub))
-        parent_component = c.parent_component()
-        if parent_component.is_indexed():
-            del parent_component[c.index()]
-        else:
-            parent_block.del_component(c)
-
-    for c in nonrelaxation_component_data_objects(m, ctype=pe.Objective, active=True, descend_into=descend_into, sort=True):
-        degree = polynomial_degree(c.expr)
-        if degree is not None:
-            if degree <= 1:
-                continue
-
-        if c.sense == pe.minimize:
-            relaxation_side = RelaxationSide.UNDER
-        elif c.sense == pe.maximize:
-            relaxation_side = RelaxationSide.OVER
-        else:
-            raise ValueError('Encountered an objective with an unrecognized sense: ' + str(c))
-
-        parent_block = c.parent_block()
-        relaxation_side_map = ComponentMap()
-        relaxation_side_map[c.expr] = relaxation_side
-
-        if parent_block in counter_dict:
-            counter = counter_dict[parent_block]
-        else:
-            parent_block.relaxations = pe.Block()
-            parent_block.aux_vars = pe.VarList()
-            parent_block.aux_cons = pe.ConstraintList()
-            counter = RelaxationCounter()
-            counter_dict[parent_block] = counter
-
-        if not hasattr(parent_block, 'aux_objectives'):
-            parent_block.aux_objectives = pe.ObjectiveList()
-
-        new_body = _relax_expr(expr=c.expr, aux_var_map=aux_var_map, parent_block=parent_block,
-                               relaxation_side_map=relaxation_side_map, counter=counter, degree_map=degree_map)
-        sense = c.sense
-        parent_block.aux_objectives.add(new_body, sense=sense)
-        parent_component = c.parent_component()
-        if parent_component.is_indexed():
-            del parent_component[c.index()]
-        else:
-            parent_block.del_component(c)
-
-    if use_fbbt:
-        for _aux_var, relaxation in aux_var_map.values():
-            relaxation.rebuild(build_nonlinear_constraint=True)
-
-        tmp_fbbt_options = dict(fbbt_options)
-        tmp_fbbt_options['deactivate_satisfied_constraints'] = False
-        fbbt(m, **tmp_fbbt_options)
-
-        for _aux_var, relaxation in aux_var_map.values():
-            relaxation.use_linear_relaxation = True
-            relaxation.rebuild()
-    else:
-        for _aux_var, relaxation in aux_var_map.values():
-            relaxation.use_linear_relaxation = True
-            relaxation.rebuild()
-
-    return m
+    visitor = FactorableRelaxationVisitor()
+    return visitor.relax(model=model,
+                         descend_into=descend_into,
+                         in_place=in_place,
+                         use_fbbt=use_fbbt,
+                         fbbt_options=fbbt_options)

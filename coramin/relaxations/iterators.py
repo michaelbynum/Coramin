@@ -1,8 +1,9 @@
 import pyomo.environ as pe
 from .relaxations_base import BaseRelaxationData
+from typing import Generator
 
 
-def relaxation_data_objects(block, descend_into=True, active=None, sort=False):
+def relaxation_data_objects(block, descend_into=True, active=None, sort=False) -> Generator[BaseRelaxationData, None, None]:
     """
     Iterate over all instances of BaseRelaxationData in the block.
 
